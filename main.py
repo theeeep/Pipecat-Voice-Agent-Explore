@@ -14,7 +14,6 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 
 # logger.info("✅ Silero VAD model loaded")
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
 
 # logger.info("Loading pipeline components...")
 from pipecat.pipeline.pipeline import Pipeline
@@ -31,9 +30,40 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 
+# Pipecat Flows imports
+from pipecat_flows import FlowArgs, FlowManager, FlowsFunctionSchema, NodeConfig
+
 logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
+
+
+def create_greeting_node() -> NodeConfig:
+    return NodeConfig(
+        name="greeting",
+        task_messages=[
+            {
+                "role": "system",
+                "content": "Greet the user warmly, introduce yourself, and ask for their name. Wait for their response.",
+            }
+        ],
+        functions=[
+            FlowsFunctionSchema(
+                name="record_name",
+                handler=handler_name,
+                description="",
+                properties={"name": {"type": "string"}},
+                required=["name"],
+            )
+        ],
+    )
+
+
+## handler
+async def handler_name(args: FlowArgs, flow_manager: FlowManager) -> tuple[None, NodeConfig]:
+    logger.info(f"User's name is {args['name']}")
+    flow_manager.state.update({"name": args["name"]})
+    return (None, create_greeting_node())
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
@@ -48,14 +78,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a friendly AI assistant. Respond naturally and keep your answers conversational.",
-        },
-    ]
-
-    context = LLMContext(messages)
+    context = LLMContext()
     context_aggregator = LLMContextAggregatorPair(context)
 
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
@@ -82,12 +105,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         observers=[RTVIObserver(rtvi)],
     )
 
+    # Initialize flow Manager in dynamic mode
+    flow_manager = FlowManager(task=task, llm=llm, context_aggregator=context_aggregator, transport=transport)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
         # Kick off the conversation.
-        messages.append({"role": "system", "content": "Say hello and briefly introduce yourself."})
-        await task.queue_frames([LLMRunFrame()])
+        await flow_manager.initialize(create_greeting_node())
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
