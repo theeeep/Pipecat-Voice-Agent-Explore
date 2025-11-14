@@ -1,5 +1,6 @@
 import os
 
+import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -26,6 +27,10 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+
+## HeyGenAI
+from pipecat.services.heygen.api import AvatarQuality, NewSessionRequest
+from pipecat.services.heygen.video import HeyGenVideoService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
@@ -248,61 +253,74 @@ async def handle_end_conversation(args: FlowArgs, flow_manager: FlowManager) -> 
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info("Starting bot")
+    async with aiohttp.ClientSession() as session:
+        logger.info("Starting bot")
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="e07c00bc-4134-4eae-9ea4-1a55fb45746b",  # Brooke
-    )
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            voice_id="e07c00bc-4134-4eae-9ea4-1a55fb45746b",  # Brooke
+        )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
-    context = LLMContext()
-    context_aggregator = LLMContextAggregatorPair(context)
+        heyGen = HeyGenVideoService(
+            api_key=os.getenv("HEYGEN_API_KEY"),
+            session=session,
+            session_request=NewSessionRequest(
+                avatar_id="Marianne_CasualLook_public",
+                version="v2",
+                quality=AvatarQuality.high,
+            ),
+        )
 
-    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+        context = LLMContext()
+        context_aggregator = LLMContextAggregatorPair(context)
 
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Transport user input
-            rtvi,  # RTVI processor
-            stt,
-            context_aggregator.user(),  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            context_aggregator.assistant(),  # Assistant spoken responses
-        ]
-    )
+        rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        observers=[RTVIObserver(rtvi)],
-    )
+        pipeline = Pipeline(
+            [
+                transport.input(),  # Transport user input
+                rtvi,  # RTVI processor
+                stt,
+                context_aggregator.user(),  # User responses
+                llm,  # LLM
+                tts,  # TTS
+                heyGen,  # HeyGen
+                transport.output(),  # Transport bot output
+                context_aggregator.assistant(),  # Assistant spoken responses
+            ]
+        )
 
-    # Initialize flow Manager in dynamic mode
-    flow_manager = FlowManager(task=task, llm=llm, context_aggregator=context_aggregator, transport=transport)
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                enable_metrics=True,
+                enable_usage_metrics=True,
+                allow_interruptions=True,
+            ),
+            observers=[RTVIObserver(rtvi)],
+        )
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info("Client connected")
-        # Kick off the conversation.
-        await flow_manager.initialize(create_greeting_node())
+        # Initialize flow Manager in dynamic mode
+        flow_manager = FlowManager(task=task, llm=llm, context_aggregator=context_aggregator, transport=transport)
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info("Client disconnected")
-        await task.cancel()
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info("Client connected")
+            # Kick off the conversation.
+            await flow_manager.initialize(create_greeting_node())
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info("Client disconnected")
+            await task.cancel()
 
-    await runner.run(task)
+        runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+
+        await runner.run(task)
 
 
 async def bot(runner_args: RunnerArguments):
@@ -310,14 +328,27 @@ async def bot(runner_args: RunnerArguments):
 
     transport_params = {
         "daily": lambda: DailyParams(
+            # Audio
             audio_in_enabled=True,
             audio_out_enabled=True,
+            # Video
+            video_out_enabled=True,
+            video_out_is_live=True,
+            video_out_width=1280,
+            video_out_height=720,
+            video_out_bitrate=2_000_000,  # 2MBps
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
             turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
         "webrtc": lambda: TransportParams(
+            # Audio
             audio_in_enabled=True,
             audio_out_enabled=True,
+            # Video
+            video_out_enabled=True,
+            video_out_is_live=True,
+            video_out_width=1280,
+            video_out_height=720,
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
             turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
